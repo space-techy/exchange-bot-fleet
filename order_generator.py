@@ -20,12 +20,16 @@ class GeneratorConfig:
 
     # Price offset distribution (How wide or near you want price distribution to be)
     offset_lambda: float = 0.2              # higher = tighter book (ver near prices), lower = wider book (very distributed prices)
-    aggressive_overshoot_min: int = 1        # how far PAST the mid-price an aggressive order goes
-    aggressive_overshoot_max: int = 100      # how far PAST the mid-price an aggressive order goes
+    max_price_deviation: int = 50           # for squared-random method
+    price_distribution: str = "squared"     # "exponential" or "squared"
+    aggressive_overshoot_min: int = 1       # how far PAST the mid-price an aggressive order goes
+    aggressive_overshoot_max: int = 100     # how far PAST the mid-price an aggressive order goes
 
     # Quantity distribution
     qty_min: int = 1                        # minimum quantity of orders
     qty_max: int = 100                      # maximum quantity of orders
+    qty_scale: int = 6                      # for multiplied-random method
+    qty_distribution: str = "heavy_tail"    # "uniform" or "heavy_tail"
 
     # Side balance
     buy_probability: int = 0.50             # 0.5 = balanced, 0.7 = more buys compared to sells
@@ -35,6 +39,9 @@ class GeneratorConfig:
 
     # limits
     total_orders: int = 10000               # no. of total orders
+
+    # self-regulating book depth
+    target_book_depth: int = 10000          
 
 
 class OrderGenerator:
@@ -107,6 +114,18 @@ class OrderGenerator:
         """Weighted random choice of operation type."""
         config = self.config
         roll = self.rng.random()
+        book_size = len(self.active_orders)
+        target_depth = self.config.target_book_depth
+
+        if book_size < target_depth * 0.5:
+            # Book is thin — force more passive orders to fill it up
+            if self.rng.random() < 0.8:
+                return "passive_new"
+
+        if book_size > target_depth * 1.5:
+            # Book is overfull — force more cancels to trim it
+            if self.rng.random() < 0.6:
+                return "cancel"
 
         # can't cancel if there are no active orders
         if self.get_active_order_count() <= 0:
@@ -138,12 +157,22 @@ class OrderGenerator:
         return "sell"
 
     def _sample_offset(self) -> int:
-        """Exponential distribution — most offsets small, few large."""
-        raw = self.rng.expovariate(self.config.offset_lambda)
-        return max(1, round(raw))
+        """Exponential or Squared Random distribution — most offsets small, few large."""
+        if(self.config.price_distribution == "squared"):
+            raw = (self.rng.random() ** 2) * self.config.max_price_deviation
+            return max(1, round(raw))
+        else:
+            raw = self.rng.expovariate(self.config.offset_lambda)
+            return max(1, round(raw))
     
     def _sample_qty(self) -> int:
-        return self.rng.randint(self.config.qty_min, self.config.qty_max)
+        if(self.config.qty_distribution == "heavy_tail"):
+            base = self.config.qty_min
+            scale = self.config.qty_scale 
+            raw = base + self.rng.randint(0, scale) * self.rng.randint(0, scale) * self.rng.randint(0, scale)
+            return min(raw, self.config.qty_max)
+        else:
+            return self.rng.randint(self.config.qty_min, self.config.qty_max)
     
     def _next_oid(self) -> int:
         oid = self.next_order_id
