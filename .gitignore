@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+*.png
+BOT_FLEET_README.md
+PROJECT_README.md

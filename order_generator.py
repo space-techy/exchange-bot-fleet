@@ -40,9 +40,6 @@ class GeneratorConfig:
     # limits
     total_orders: int = 10000               # no. of total orders
 
-    # self-regulating book depth
-    target_book_depth: int = 10000          
-
 
 class OrderGenerator:
     """
@@ -105,7 +102,7 @@ class OrderGenerator:
     def _step_price(self):
         """Mean-reverting random walk."""
         config = self.config
-        price_pull = config.mean_reversion + (config.fair_value - self.ref_price)
+        price_pull = config.mean_reversion * (config.fair_value - self.ref_price)
         noise = self.rng.gauss(0, config.volatility)
         self.ref_price += round(price_pull + noise)
         self.ref_price = max(1, self.ref_price)
@@ -114,18 +111,6 @@ class OrderGenerator:
         """Weighted random choice of operation type."""
         config = self.config
         roll = self.rng.random()
-        book_size = len(self.active_orders)
-        target_depth = self.config.target_book_depth
-
-        if book_size < target_depth * 0.5:
-            # Book is thin — force more passive orders to fill it up
-            if self.rng.random() < 0.8:
-                return "passive_new"
-
-        if book_size > target_depth * 1.5:
-            # Book is overfull — force more cancels to trim it
-            if self.rng.random() < 0.6:
-                return "cancel"
 
         # can't cancel if there are no active orders
         if self.get_active_order_count() <= 0:
@@ -198,7 +183,6 @@ class OrderGenerator:
         
         return {
             "action": "new_order",
-            "type": "passive", 
             "client_id": self.client_id, 
             "symbol" : self.config.symbol, 
             "order_id": oid, 
@@ -226,7 +210,6 @@ class OrderGenerator:
         
         return {
             "action": "new_order",
-            "type": "aggressive", 
             "client_id": self.client_id,
             "order_id": oid,
             "symbol": self.config.symbol,
@@ -241,7 +224,6 @@ class OrderGenerator:
         del self.active_orders[oid]
         return {
             "action": "cancel",
-            "type": "cancel", 
             "client_id": self.client_id,
             "order_id": oid,
             "symbol": self.config.symbol
@@ -255,8 +237,7 @@ class OrderGenerator:
         self.active_orders[oid]["qty"] = new_qty
 
         return {
-            "action": "modify",
-            "type": "modify", 
+            "action": "modify", 
             "client_id": self.client_id,
             "order_id": oid,
             "symbol": self.config.symbol,
