@@ -45,6 +45,8 @@ class FileSink(TelemetrySink):
     def write_batch(self, events):
         # Buffered for the (future) real sink. We deliberately don't print
         # per-order events — too noisy. The driver prints phase summaries instead.
+        # for e in events:
+        #     print(e)
         pass
 
     def close(self):
@@ -232,7 +234,6 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
 
             telemetry.record({
                 "type": "order_sent",
-                "bot_id": generator.bot_id,
                 "client_id": order.get("client_id"),
                 "order_id": oid,
                 "action": order["action"],
@@ -300,7 +301,6 @@ def _handle_item(item: dict, t_recv: int, pending: dict,
 
     telemetry.record({
         "type": "order_response",
-        "bot_id": generator.bot_id,
         "client_id": generator.client_id,
         "order_id": oid,
         "action": sent["action"] if sent else None,
@@ -339,12 +339,15 @@ def _extract_oid(item: dict) -> int | None:
 
 # ─────────────────────────── per-bot driver ──────────────────────────────────
 
-def _per_bot_total(phase_name: str, num_bots: int) -> int:
-    """Split a phase's fleet total_orders evenly across bots."""
-    return max(1, PHASE_CONFIGS[phase_name].total_orders // num_bots)
+def _per_bot_total(phase_name: str, num_bots: int, divisor: int) -> int:
+    """This bot's order count for a phase: the fleet total scaled down by the
+    pod's volume divisor, then split evenly across the pod's bots."""
+    pod_total = PHASE_CONFIGS[phase_name].total_orders // max(1, divisor)
+    return max(1, pod_total // num_bots)
 
 
-async def run_single_bot(bot_id: int, plan_name: str, num_bots: int):
+async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
+                         symbol: int, divisor: int, pod_id: int):
     pending: dict = {}
     telemetry = TelemetryCollector(bot_id)
     telemetry.start()                       # periodic-flush task
@@ -358,9 +361,10 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int):
     first_cfg = dataclasses.replace(
         PHASE_CONFIGS[first[0]],
         seed=GLOBAL_SEED * 1000 + bot_id,
-        total_orders=_per_bot_total(first[0], num_bots),
+        total_orders=_per_bot_total(first[0], num_bots, divisor),
+        symbol=symbol,
     )
-    generator = OrderGenerator(bot_id, first_cfg)
+    generator = OrderGenerator(bot_id, first_cfg, pod_id=pod_id)
 
     try:
         async with websockets.connect(URI) as ws:
@@ -373,7 +377,8 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int):
                 cfg = dataclasses.replace(
                     PHASE_CONFIGS[phase_name],
                     seed=GLOBAL_SEED * 1000 + bot_id,
-                    total_orders=_per_bot_total(phase_name, num_bots),
+                    total_orders=_per_bot_total(phase_name, num_bots, divisor),
+                    symbol=symbol,
                 )
                 generator.update_config(cfg)
                 done = asyncio.Event()
@@ -396,22 +401,35 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int):
         await telemetry.stop()
 
 
-async def main(num_bots: int = 5, plan_name: str = "quick"):
+async def main(num_bots: int = 5, plan_name: str = "quick",
+               symbol: int = 1, divisor: int = 1, pod_id: int = 0):
     await asyncio.gather(*[
-        run_single_bot(bot_id, plan_name, num_bots)
+        run_single_bot(bot_id, plan_name, num_bots, symbol, divisor, pod_id)
         for bot_id in range(1, num_bots + 1)
     ])
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Production bot fleet")
+    p = argparse.ArgumentParser(description="Production bot fleet (one pod = one symbol)")
     p.add_argument("--num-bots", type=int,
-                   default=int(os.environ.get("NUM_BOTS", "5")))
+                   default=int(os.environ.get("NUM_BOTS", "5")),
+                   help="bots in this pod — the pressure dial on the symbol")
     p.add_argument("--plan", default=os.environ.get("PLAN_NAME", "quick"),
                    choices=list(TEST_PLANS.keys()))
+    p.add_argument("--symbol", type=int,
+                   default=int(os.environ.get("SYMBOL", "1")),
+                   help="the single symbol every bot in this pod trades")
+    p.add_argument("--order-divisor", type=int,
+                   default=int(os.environ.get("ORDER_DIVISOR", "1")),
+                   help="volume dial — each phase's total_orders is divided by this")
+    p.add_argument("--pod-id", type=int,
+                   default=int(os.environ.get("POD_ID", "0")),
+                   help="unique pod id — offsets client_id/order_id so pods never collide")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    asyncio.run(main(num_bots=args.num_bots, plan_name=args.plan))
+    asyncio.run(main(num_bots=args.num_bots, plan_name=args.plan,
+                     symbol=args.symbol, divisor=args.order_divisor,
+                     pod_id=args.pod_id))

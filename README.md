@@ -86,11 +86,9 @@ A dataclass holding **every knob** that shapes order generation. The important o
 - **Balance & scale** — `buy_probability` (0.5 = balanced, 0.9 = heavy buy
   pressure) and `total_orders` (how many orders the phase generates — see the note
   on splitting below).
-- **Symbols** — `min_symbol`/`max_symbol`: each order draws a random symbol in that
-  range, so load spreads across many instruments (the default is `1`–`100`). Set
-  them equal to pin everything to a single symbol (it falls back to the `symbol`
-  field). A cancel or modify always reuses the symbol its original order was
-  created with.
+- **Symbol** — `symbol`: the single instrument this generator trades. It's set
+  per-pod by the runner (see Pods below), not in the phase config, so every order a
+  bot sends — including its cancels and modifies — carries the same symbol.
 
 ### `OrderGenerator` (in `order_generator.py`)
 
@@ -126,9 +124,24 @@ dropped).
 | `buy_pressure` | 90% buys — an asymmetric, lopsided book. |
 | `recovery` | Back to gentle load — did the engine return to baseline after the stress? |
 
-> **Note on `total_orders`:** the number in a phase config is the **fleet total**.
-> The runner divides it by the number of bots, so each bot does its share. Run with
-> more bots and each one does proportionally less — the total stays the same.
+### Pods: one symbol, two dials, an identity
+
+A **pod** is one run of `bot_runner.py` — a fleet of bots all trading **one symbol**.
+It's the unit of load you point at a single book, and it has four knobs:
+
+- **`--symbol`** — the one book every bot in the pod hammers.
+- **`--num-bots`** — the **pressure** dial: concurrency against that book.
+- **`--order-divisor`** — the **volume** dial: every phase's `total_orders` is divided
+  by it, so the pod runs the standard plan at 1/N scale. `build_book` is 60k, so
+  divisor `2` → 30k, `6` → 10k, `60` → 1k. Per bot per phase you get
+  `max(1, (total // divisor) // num_bots)`.
+- **`--pod-id`** — a unique id per pod. It offsets `client_id` and `order_id`
+  (`global_bot = pod_id * 100_000 + bot_id`) so two pods never collide and every
+  event is attributable. `--pod-id 0` reproduces the old single-pod ids.
+
+You build a whole market by launching **many pods**: e.g. symbols 2,3,4 heavy
+(divisor `2`), the rest light (divisor `60`). Multiple pods can even point at the
+**same** symbol (different `--pod-id`s) to stack heavier load on one book.
 
 ## Running it
 
@@ -142,21 +155,28 @@ pip install websockets matplotlib
 Have your matching engine listening for WebSocket connections (default
 `ws://localhost:3001/ws`).
 
-**Run the production fleet:**
+**Run the production fleet (one pod):**
 
 ```bash
-python bot_runner.py --num-bots 5 --plan standard
+# pod targeting symbol 2, 5 bots, full volume
+python bot_runner.py --plan standard --symbol 2 --num-bots 5
+
+# a lighter pod on symbol 7: 1/6 the orders
+python bot_runner.py --plan standard --symbol 7 --num-bots 5 --order-divisor 6 --pod-id 1
 ```
 
-It runs silently and streams telemetry to the configured sink. Behaviour is tuned
-with environment variables:
+It runs silently and streams telemetry to the configured sink. Every flag has an
+env-var equivalent:
 
-| Variable | Default | Meaning |
+| Variable / flag | Default | Meaning |
 |----------|---------|---------|
 | `ENGINE_URI` | `ws://localhost:3001/ws` | Where the engine is. |
-| `NUM_BOTS` | `5` | Fleet size (or `--num-bots`). |
-| `PLAN_NAME` | `quick` | Which test plan (or `--plan`). |
-| `GLOBAL_SEED` | `42` | Base seed. Each bot's seed is `GLOBAL_SEED * 1000 + bot_id`. |
+| `NUM_BOTS` / `--num-bots` | `5` | Bots in this pod — the pressure dial. |
+| `SYMBOL` / `--symbol` | `1` | The single symbol this pod trades. |
+| `ORDER_DIVISOR` / `--order-divisor` | `1` | Volume dial — divides every phase's `total_orders`. |
+| `POD_ID` / `--pod-id` | `0` | Unique pod id — offsets `client_id`/`order_id` so pods don't collide. |
+| `PLAN_NAME` / `--plan` | `quick` | Which test plan. |
+| `GLOBAL_SEED` | `42` | Base seed. Each bot's seed folds `GLOBAL_SEED`, `pod_id`, and `bot_id`. |
 | `TELEMETRY_SINK` | `file` | `file` (no-op placeholder today) or `kafka` (stub). |
 | `PHASE_SOURCE` | `local` | `local` (walk the plan) or `redis` (stub → falls back to local). |
 | `FLUSH_INTERVAL_S` | `1.0` | How often telemetry is flushed even at low rate. |
@@ -165,13 +185,40 @@ with environment variables:
 **Run the visualizer:**
 
 Edit the constants at the top of `live_visualizer.py` (`URI`, `NUM_BOTS`,
-`PLAN_NAME`, `GLOBAL_SEED`), then:
+`PLAN_NAME`, `GLOBAL_SEED`, and `SYMBOL`/`ORDER_DIVISOR`/`POD_ID`), then:
 
 ```bash
 python live_visualizer.py
 ```
 
-It writes one chart per phase into `results/`.
+It writes one chart per phase into `results/`. Because the whole run trades one
+`SYMBOL`, the reconstructed book is exactly that one book.
+
+## Scaling & how much load is "real" stress
+
+The pod model gives you two independent dials, and which one you turn depends on
+what you want to break:
+
+- **Pressure on a single book** (lock contention, deep matching, long cancel
+  queues) comes from **bots-per-symbol × rate**. To push one book hard, point
+  *many* bots — or *many pods* (same `--symbol`, different `--pod-id`) — at it.
+  One book at 50k orders/sec is a very different test than fifty books at 1k each.
+- **Breadth** (memory, many books, cache footprint) comes from **how many distinct
+  symbols** are live. Spread pods across many `--symbol`s, each gentle.
+
+**Depth to make matching/cancel phases bite:** an aggressive order on symbol X only
+matches symbol X's resting orders, so a thin book just rests instead of trading. In
+`build_book` each book ends up with roughly `total_orders // divisor` resting orders
+(split across the pod's bots). So if you want ~5k depth per book before the spike,
+size the divisor accordingly — at the default 60k, divisor `1` gives ~60k per book,
+divisor `12` gives ~5k.
+
+**What's "enough" for real stress:** drive aggregate throughput toward the engine's
+ceiling. A single pod of 5 bots at 1k/s is 5k orders/sec — gentle. Ten pods of 5
+bots at 1k/s is 50k/sec; stack several pods on the same symbol and you concentrate
+that into one book's hot path. Start by raising throughput until `order_response`
+latency percentiles start climbing — that inflection is where the engine begins to
+hurt, and it's the number worth reporting.
 
 ## Telemetry
 
@@ -223,13 +270,14 @@ Reading them by phase:
 - **Sinks/coordination are stubs.** The file sink is a no-op, the Kafka sink and the
   Redis phase coordinator are scaffolding that falls back to local behaviour. There
   is no validator/aggregator consuming the telemetry yet.
-- **Single symbol per run.**
+- **One symbol per pod (by design).** A single run trades one symbol; many symbols
+  means many pods. That's the model, not a bug — but there's no single-process
+  "spread across N symbols" mode, so multi-symbol load is an orchestration concern.
 - **Backpressure is transport-level only.** `await ws.send()` naturally pauses a bot
   when the engine's socket buffer fills; there's no application-level throttle for an
   engine that reads fast but processes slowly.
 - **No zombie sweep.** If the engine never replies to an order, its entry lingers in
-  the in-flight map for the bot's lifetime (reported as `pending_left` is gone now
-  that prints are off, but the memory effect remains).
+  the in-flight map for the bot's lifetime (memory only).
 - **Cancel/modify targets depend on engine acks.** Generation is deterministic, but
   which live orders are available to cancel/modify depends on what the engine has
   confirmed — so wall-clock timing can influence those choices.

@@ -39,6 +39,12 @@ GLOBAL_SEED = 42
 NUM_BOTS = 5
 PLAN_NAME = "standard"
 
+# This debug tool is effectively a single pod: every bot trades ONE symbol, so
+# the reconstructed book plot reflects exactly that one book.
+SYMBOL = 1
+ORDER_DIVISOR = 1        # divide every phase's total_orders (volume dial)
+POD_ID = 0               # offsets client_id/order_id; keep 0 for a standalone run
+
 
 # ─────────────────────────── books ──────────────────────────────────────────
 
@@ -372,9 +378,10 @@ async def run_bot(bot_id, plan, fleet_book, submitted_book,
     first_cfg = dataclasses.replace(
         PHASE_CONFIGS[plan[0][0]],
         seed=GLOBAL_SEED * 1000 + bot_id,
-        total_orders=max(1, PHASE_CONFIGS[plan[0][0]].total_orders // NUM_BOTS),
+        total_orders=max(1, (PHASE_CONFIGS[plan[0][0]].total_orders // max(1, ORDER_DIVISOR)) // NUM_BOTS),
+        symbol=SYMBOL,
     )
-    generator = OrderGenerator(bot_id, first_cfg)
+    generator = OrderGenerator(bot_id, first_cfg, pod_id=POD_ID)
     generators_out[bot_id] = generator
 
     try:
@@ -383,7 +390,8 @@ async def run_bot(bot_id, plan, fleet_book, submitted_book,
                 cfg = dataclasses.replace(
                     PHASE_CONFIGS[phase_name],
                     seed=GLOBAL_SEED * 1000 + bot_id,
-                    total_orders=max(1, PHASE_CONFIGS[phase_name].total_orders // NUM_BOTS),
+                    total_orders=max(1, (PHASE_CONFIGS[phase_name].total_orders // max(1, ORDER_DIVISOR)) // NUM_BOTS),
+                    symbol=SYMBOL,
                 )
                 generator.update_config(cfg)
                 done = asyncio.Event()

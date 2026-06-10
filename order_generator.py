@@ -1,6 +1,11 @@
 import random
 from dataclasses import dataclass
 
+# Per-pod namespace for bot indices. Each pod owns a block of this many bot ids,
+# so client_id / order_id never collide across pods. Far larger than any real
+# per-pod bot count.
+MAX_BOTS_PER_POD = 100
+
 @dataclass
 class GeneratorConfig:
     """All parameters that control order generation."""
@@ -35,9 +40,7 @@ class GeneratorConfig:
     buy_probability: int = 0.50             # 0.5 = balanced, 0.7 = more buys compared to sells
 
     # symbol
-    symbol: int = 1                         # fallback symbol when min == max
-    min_symbol: int = 1                     # orders draw a random symbol in
-    max_symbol: int = 100                   # [min_symbol, max_symbol] — widen for many symbols
+    symbol: int = 1                         # the single symbol this bot trades (set per-pod by the runner)
 
     # limits
     total_orders: int = 10000               # no. of total orders
@@ -49,19 +52,27 @@ class OrderGenerator:
     Deterministic: same config + same seed = same orders always.
     """
 
-    def __init__(self, bot_id : int, config: GeneratorConfig):
-        
+    def __init__(self, bot_id : int, config: GeneratorConfig, pod_id: int = 0):
+
         self.bot_id = bot_id
+        self.pod_id = pod_id
         self.config = config
 
-        # Each bot gets a unique but deterministic random seed
-        self.rng = random.Random(config.seed * 1000 + bot_id)
+        # Globally-unique bot index across pods. pod_id carves out a 100k-bot
+        # namespace each, so (pod, bot) never collide on client_id or order_id.
+        # pod_id=0 reproduces the old single-pod ids (client_id == bot_id).
+        global_bot = pod_id * MAX_BOTS_PER_POD + bot_id
 
-        # reference price which is played with
+        # Deterministic per-(pod,bot) seed — folds global_bot so two pods don't
+        # emit byte-identical streams.
+        self.rng = random.Random(config.seed * 1000 + global_bot)
+
+        # one mean-reverting price walk for this bot's single symbol
         self.ref_price = config.start_price
 
-        # Order Tracking
-        self.client_id = bot_id
+        # Order Tracking — client_id is the global index; order_ids live in this
+        # bot's own 100M-wide range so they never overlap another (pod, bot).
+        self.client_id = global_bot
 
         # TODO to make order independent of order id by adding client id
         # - Add client_order_id field to Message struct (what the client sends)
@@ -73,7 +84,7 @@ class OrderGenerator:
         # - Validator can use either ID for matching
         # TODO end
 
-        self.next_order_id = bot_id * 100_000_000
+        self.next_order_id = global_bot * 100_000_000
 
         # order_id → {side, price, qty}
         self.active_orders : dict[ int, dict] = {}          
@@ -118,7 +129,7 @@ class OrderGenerator:
         return order
     
     def _step_price(self):
-        """Mean-reverting random walk."""
+        """Mean-reverting random walk for this bot's single symbol."""
         config = self.config
         price_pull = config.mean_reversion * (config.fair_value - self.ref_price)
         noise = self.rng.gauss(0, config.volatility)
@@ -159,13 +170,6 @@ class OrderGenerator:
             return "buy"
         return "sell"
 
-    def _pick_symbol(self) -> int:
-        """Random symbol in [min_symbol, max_symbol]. When they're equal (the
-        default) every order uses the single `symbol` — backward compatible."""
-        if self.config.max_symbol > self.config.min_symbol:
-            return self.rng.randint(self.config.min_symbol, self.config.max_symbol)
-        return self.config.symbol
-
     def _sample_offset(self) -> int:
         """Exponential or Squared Random distribution — most offsets small, few large."""
         if(self.config.price_distribution == "squared"):
@@ -203,14 +207,13 @@ class OrderGenerator:
         price = max(1, price)
         qty = self._sample_qty()
         oid = self._next_oid()
-        symbol = self._pick_symbol()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price, "symbol": symbol}
+        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
 
         return {
             "action": "new_order",
             "client_id": self.client_id,
-            "symbol" : symbol,
+            "symbol" : self.config.symbol,
             "order_id": oid,
             "side" : side,
             "qty" : qty,
@@ -231,15 +234,14 @@ class OrderGenerator:
         price = max(1, price)
         qty = self._sample_qty()
         oid = self._next_oid()
-        symbol = self._pick_symbol()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price, "symbol": symbol}
+        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
 
         return {
             "action": "new_order",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": symbol,
+            "symbol": self.config.symbol,
             "side": side,
             "price": price,
             "qty": qty
@@ -248,13 +250,12 @@ class OrderGenerator:
     def _make_cancel(self) -> dict:
         """Cancel a random active order."""
         oid = self.rng.choice(list(self.active_orders.keys()))
-        symbol = self.active_orders[oid]["symbol"]   # must match the original order
         del self.active_orders[oid]
         return {
             "action": "cancel",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": symbol
+            "symbol": self.config.symbol
         }
 
     def _make_modify(self) -> dict:
@@ -268,7 +269,7 @@ class OrderGenerator:
             "action": "modify",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": self.active_orders[oid]["symbol"],   # must match the original order
+            "symbol": self.config.symbol,
             "qty": new_qty
         }
 
