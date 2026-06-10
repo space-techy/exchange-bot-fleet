@@ -35,7 +35,9 @@ class GeneratorConfig:
     buy_probability: int = 0.50             # 0.5 = balanced, 0.7 = more buys compared to sells
 
     # symbol
-    symbol: int = 1                         # company name in symbol
+    symbol: int = 1                         # fallback symbol when min == max
+    min_symbol: int = 1                     # orders draw a random symbol in
+    max_symbol: int = 100                   # [min_symbol, max_symbol] — widen for many symbols
 
     # limits
     total_orders: int = 10000               # no. of total orders
@@ -60,7 +62,18 @@ class OrderGenerator:
 
         # Order Tracking
         self.client_id = bot_id
-        self.next_order_id = bot_id * 1_000_000
+
+        # TODO to make order independent of order id by adding client id
+        # - Add client_order_id field to Message struct (what the client sends)
+        # - Engine generates its own internal order_id (atomic counter, simple increment)
+        # - Engine stores mapping: internal_order_id ↔ {client_id, client_order_id}
+        # - All internal book operations use engine's order_id (faster: simple integer, no composite key)
+        # - All responses include BOTH: {"order_id": 847291, "client_order_id": 1000042, "client_id": 1}
+        # - Bot matches responses using client_order_id (which it generated)
+        # - Validator can use either ID for matching
+        # TODO end
+
+        self.next_order_id = bot_id * 100_000_000
 
         # order_id → {side, price, qty}
         self.active_orders : dict[ int, dict] = {}          
@@ -81,6 +94,11 @@ class OrderGenerator:
 
     def get_active_order_count(self) -> int:
         return len(self.active_orders)
+
+    def remove_active_order(self, oid: int) -> bool:
+        """Drop an order the engine told us is gone (fully filled / cancelled / rejected).
+        Keeps the generator's view in sync so future cancel/modify ops target live orders only."""
+        return self.active_orders.pop(oid, None) is not None
     
 
     def generate_next(self) -> dict:
@@ -141,6 +159,13 @@ class OrderGenerator:
             return "buy"
         return "sell"
 
+    def _pick_symbol(self) -> int:
+        """Random symbol in [min_symbol, max_symbol]. When they're equal (the
+        default) every order uses the single `symbol` — backward compatible."""
+        if self.config.max_symbol > self.config.min_symbol:
+            return self.rng.randint(self.config.min_symbol, self.config.max_symbol)
+        return self.config.symbol
+
     def _sample_offset(self) -> int:
         """Exponential or Squared Random distribution — most offsets small, few large."""
         if(self.config.price_distribution == "squared"):
@@ -178,19 +203,20 @@ class OrderGenerator:
         price = max(1, price)
         qty = self._sample_qty()
         oid = self._next_oid()
+        symbol = self._pick_symbol()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
-        
+        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price, "symbol": symbol}
+
         return {
             "action": "new_order",
-            "client_id": self.client_id, 
-            "symbol" : self.config.symbol, 
-            "order_id": oid, 
-            "side" : side, 
-            "qty" : qty, 
+            "client_id": self.client_id,
+            "symbol" : symbol,
+            "order_id": oid,
+            "side" : side,
+            "qty" : qty,
             "price": price
         }
-    
+
     def _make_aggressive_order(self) -> dict:
         """Order placed THROUGH mid — will match against resting orders."""
         price = self.ref_price
@@ -205,14 +231,15 @@ class OrderGenerator:
         price = max(1, price)
         qty = self._sample_qty()
         oid = self._next_oid()
+        symbol = self._pick_symbol()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
-        
+        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price, "symbol": symbol}
+
         return {
             "action": "new_order",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": self.config.symbol,
+            "symbol": symbol,
             "side": side,
             "price": price,
             "qty": qty
@@ -221,12 +248,13 @@ class OrderGenerator:
     def _make_cancel(self) -> dict:
         """Cancel a random active order."""
         oid = self.rng.choice(list(self.active_orders.keys()))
+        symbol = self.active_orders[oid]["symbol"]   # must match the original order
         del self.active_orders[oid]
         return {
             "action": "cancel",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": self.config.symbol
+            "symbol": symbol
         }
 
     def _make_modify(self) -> dict:
@@ -237,10 +265,10 @@ class OrderGenerator:
         self.active_orders[oid]["qty"] = new_qty
 
         return {
-            "action": "modify", 
+            "action": "modify",
             "client_id": self.client_id,
             "order_id": oid,
-            "symbol": self.config.symbol,
+            "symbol": self.active_orders[oid]["symbol"],   # must match the original order
             "qty": new_qty
         }
 

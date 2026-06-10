@@ -2,11 +2,14 @@
 LIVE visualizer / debugger.
 
 Runs the bot fleet against the real matching engine over WebSocket, reconstructs
-the engine's order book from its RESPONSES (not from the generator's view), and
-after each phase produces a matplotlib chart + text summary.
+the engine's order book from its RESPONSES, and after each phase produces a
+TWO-PANEL matplotlib chart + text summary:
 
-Use this to see what the engine actually does, vs. what visualizer.py shows
-(which is what the generator THOUGHT the book looks like).
+  TOP    — Submitted: what the fleet TRIED to put on the book (no matching).
+  BOTTOM — Engine truth: what's ACTUALLY on the book after matching.
+
+The gap between the two visualises the matching activity for that phase:
+how much of the submitted depth got consumed, where it got consumed.
 
 Run: python live_visualizer.py     (engine must be at ws://localhost:3001/ws)
 Outputs: live_book_shape_<phase>.png + stdout summary
@@ -15,36 +18,38 @@ Outputs: live_book_shape_<phase>.png + stdout summary
 import asyncio
 import dataclasses
 import json
+import os
 import time
 from collections import defaultdict, Counter
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 from configs import PHASE_CONFIGS, TEST_PLANS
 from order_generator import OrderGenerator
-from visualizer import print_summary, plot_phase
+from visualizer import print_summary
 
 
 URI = "ws://localhost:3001/ws"
 GLOBAL_SEED = 42
 NUM_BOTS = 5
 PLAN_NAME = "standard"
-ORDERS_PER_BOT_PER_PHASE = 2000          # ~10k per phase across the fleet
 
+
+# ─────────────────────────── books ──────────────────────────────────────────
 
 class FleetBook:
-    """
-    Engine-truth book, built by feeding every response message back through
-    `handle()`. Shape is duck-typed to match visualizer.LocalBook so we can
-    reuse its print_summary / plot_phase helpers.
-    """
+    """Engine truth, built from every response message via handle()."""
 
     def __init__(self):
-        self.bids: dict[int, int] = defaultdict(int)    # price -> total remaining qty
+        self.bids: dict[int, int] = defaultdict(int)
         self.asks: dict[int, int] = defaultdict(int)
-        self.resting: dict[int, dict] = {}              # order_id -> {side, price, qty}
-        self.trades: list[tuple[int, int]] = []         # (price, qty) for the CURRENT phase
+        self.resting: dict[int, dict] = {}
+        self.trades: list[tuple[int, int]] = []          # per-phase
 
     def reset_phase_trades(self):
         self.trades = []
@@ -56,28 +61,15 @@ class FleetBook:
         return min(self.asks) if self.asks else None
 
     def handle(self, msg: dict):
-        """Dispatch one engine message into book mutations."""
+        """Engine truth update. Same envelope for everything — aggressor responses
+        AND resting-side fill events. We just trust orders[].remaining_qty."""
         if not isinstance(msg, dict):
             return
         mtype = msg.get("type")
 
-        if mtype == "fill_notification":
-            # one of OUR resting orders got hit — engine tells us the new remaining_qty
-            self._upsert(
-                oid=msg["order_id"],
-                side=None,                              # learn from existing record
-                price=None,
-                remaining_qty=msg.get("remaining_qty", 0),
-            )
+        if mtype in ("trade_broadcast", "order_rejected"):
             return
 
-        if mtype == "trade_broadcast":
-            return                                       # would double-count; skip
-
-        if mtype == "order_rejected":
-            return
-
-        # all remaining types are responses to our submitted order, with orders[] + trades[]
         if mtype in ("partial_fill", "order_filled"):
             for t in msg.get("trades", []):
                 p, q = t.get("price"), t.get("qty")
@@ -92,44 +84,33 @@ class FleetBook:
                 self._remove(oid)
                 continue
             self._upsert(
-                oid=oid,
-                side=o.get("side"),
-                price=o.get("price"),
+                oid=oid, side=o.get("side"), price=o.get("price"),
                 remaining_qty=o.get("remaining_qty", 0),
             )
 
-    # ---- internal book mutations ----
-
-    def _upsert(self, oid: int, side: str | None, price: int | None, remaining_qty: int):
+    def _upsert(self, oid, side, price, remaining_qty):
         prev = self.resting.get(oid)
-
         if remaining_qty <= 0:
             self._remove(oid)
             return
-
-        # learn side/price from prev when caller didn't pass them (fill_notification)
         if side is None and prev is not None:
             side = prev["side"]
         if price is None and prev is not None:
             price = prev["price"]
         if side is None or price is None:
-            return                                       # not enough info to place; ignore
-
+            return
         book = self.bids if side == "buy" else self.asks
-
         if prev is None:
-            # new resting
             book[price] += remaining_qty
             self.resting[oid] = {"side": side, "price": price, "qty": remaining_qty}
         else:
-            # adjust by delta at the same price level
             delta = remaining_qty - prev["qty"]
             book[prev["price"]] += delta
             if book[prev["price"]] <= 0:
                 del book[prev["price"]]
             prev["qty"] = remaining_qty
 
-    def _remove(self, oid: int):
+    def _remove(self, oid):
         prev = self.resting.pop(oid, None)
         if prev is None:
             return
@@ -139,29 +120,101 @@ class FleetBook:
             del book[prev["price"]]
 
 
+class SubmittedBook:
+    """
+    Fleet intent. Built from the sender side. Every new_order adds to the book,
+    every cancel removes, every modify adjusts. NO MATCHING is ever applied —
+    so aggressive orders just sit at their crossing price.
+
+    Comparing this to FleetBook reveals what the matching engine consumed.
+    """
+
+    def __init__(self):
+        self.bids: dict[int, int] = defaultdict(int)
+        self.asks: dict[int, int] = defaultdict(int)
+        self.resting: dict[int, dict] = {}
+        self.trades: list = []          # always empty, kept for duck-type compat
+
+    def reset_phase_trades(self):
+        pass
+
+    def best_bid(self) -> int | None:
+        return max(self.bids) if self.bids else None
+
+    def best_ask(self) -> int | None:
+        return min(self.asks) if self.asks else None
+
+    def apply_sent(self, order: dict):
+        action = order["action"]
+        oid = order["order_id"]
+        if action == "new_order":
+            side, price, qty = order["side"], order["price"], order["qty"]
+            book = self.bids if side == "buy" else self.asks
+            book[price] += qty
+            self.resting[oid] = {"side": side, "price": price, "qty": qty}
+        elif action == "cancel":
+            prev = self.resting.pop(oid, None)
+            if prev is None:
+                return
+            book = self.bids if prev["side"] == "buy" else self.asks
+            book[prev["price"]] -= prev["qty"]
+            if book[prev["price"]] <= 0:
+                del book[prev["price"]]
+        elif action == "modify":
+            prev = self.resting.get(oid)
+            if prev is None:
+                return
+            new_qty = order["qty"]
+            delta = new_qty - prev["qty"]
+            book = self.bids if prev["side"] == "buy" else self.asks
+            book[prev["price"]] += delta
+            prev["qty"] = new_qty
+            if book[prev["price"]] <= 0:
+                del book[prev["price"]]
+                self.resting.pop(oid, None)
+
+
 # ─────────────────────────── sender / receiver ───────────────────────────────
+
+_TERMINAL_TYPES = ("order_filled", "order_cancelled", "order_rejected")
+
 
 async def sender_loop(ws, generator: OrderGenerator, pending: dict,
                       rate: int, done: asyncio.Event,
-                      bot_id: int, phase: str):
+                      bot_id: int, phase: str,
+                      telemetry: list, submitted: SubmittedBook,
+                      counts: Counter):
     interval = 1.0 / rate
     sent = 0
-    phase_start = time.monotonic()
     next_deadline = time.monotonic()
     try:
         while generator.has_more():
             order = generator.generate_next()
             t_send = time.monotonic_ns()
-            pending[order["order_id"]] = {
-                "t_send_ns": t_send, "order": order, "phase": phase,
-            }
+            oid = order["order_id"]
+            pending[oid] = {"t_send_ns": t_send, "action": order["action"], "phase": phase}
+
+            # apply to the shared intent book (single-task at a time, no lock needed)
+            submitted.apply_sent(order)
+            counts[order["action"]] += 1
+
             await ws.send(json.dumps(order))
             sent += 1
-            if sent % 500 == 0:
-                elapsed = time.monotonic() - phase_start
-                rate_actual = sent / elapsed if elapsed > 0 else 0
-                print(f"[bot {bot_id} {phase}] sent={sent} rate={rate_actual:.0f}/s "
-                      f"pending={len(pending)} gen_book={generator.get_active_order_count()}")
+
+            telemetry.append({
+                "type": "order_sent",
+                "bot_id": bot_id,
+                "client_id": bot_id,
+                "order_id": oid,
+                "action": order["action"],
+                "side": order.get("side"),
+                "price": order.get("price"),
+                "qty": order.get("qty"),
+                "symbol": order.get("symbol"),
+                "phase": phase,
+                "t_send_ns": t_send,
+            })
+
             next_deadline += interval
             sleep_for = next_deadline - time.monotonic()
             if sleep_for > 0:
@@ -169,17 +222,13 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
     except ConnectionClosed:
         print(f"[bot {bot_id} {phase}] connection closed during send")
     finally:
-        elapsed = time.monotonic() - phase_start
-        rate_actual = sent / elapsed if elapsed > 0 else 0
-        print(f"[bot {bot_id} {phase}] sender done: {sent} in {elapsed:.1f}s "
-              f"({rate_actual:.0f}/s)")
+        print(f"[bot {bot_id} {phase}] sender done: {sent} orders")
         done.set()
 
 
 async def receiver_loop(ws, pending: dict, telemetry: list,
-                        done: asyncio.Event,
-                        bot_id: int, phase: str,
-                        book: FleetBook):
+                        done: asyncio.Event, bot_id: int, phase: str,
+                        book: FleetBook, generator: OrderGenerator):
     while True:
         try:
             timeout = 2.0 if done.is_set() else 15.0
@@ -187,61 +236,143 @@ async def receiver_loop(ws, pending: dict, telemetry: list,
         except asyncio.TimeoutError:
             if done.is_set():
                 return
-            print(f"[bot {bot_id} {phase}] 15s with no response — engine slow?")
+            print(f"[bot {bot_id} {phase}] 15s with no response")
             continue
         except ConnectionClosed:
-            print(f"[bot {bot_id} {phase}] connection closed during recv")
             return
 
         t_recv = time.monotonic_ns()
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
-            print(f"[bot {bot_id} {phase}] bad JSON")
             continue
 
         items = msg if isinstance(msg, list) else [msg]
         for item in items:
             if not isinstance(item, dict):
                 continue
-
-            # feed every message into the shared engine-truth book
             book.handle(item)
+            _handle_item(item, t_recv, pending, telemetry, generator, bot_id, phase)
 
-            # also do latency tracking for orders we sent (best-effort match on orders[0])
-            oid = None
-            if "order_id" in item:
-                oid = item["order_id"]
-            else:
-                orders = item.get("orders") or []
-                if orders and isinstance(orders[0], dict):
-                    oid = orders[0].get("order_id")
-            if oid is not None and oid in pending:
-                sent = pending.pop(oid)
-                telemetry.append({
-                    "bot_id": bot_id,
-                    "order_id": oid,
-                    "action": sent["order"]["action"],
-                    "phase": sent["phase"],
-                    "latency_ns": t_recv - sent["t_send_ns"],
-                    "t_send_ns": sent["t_send_ns"],
-                    "t_recv_ns": t_recv,
-                    "msg_type": item.get("type"),
-                })
+
+def _handle_item(item, t_recv, pending, telemetry, generator, bot_id, current_phase):
+    mtype = item.get("type")
+
+    if mtype == "trade_broadcast":
+        return
+
+    oid = _extract_oid(item)
+    if oid is None:
+        return
+
+    sent = pending.pop(oid, None)
+
+    telemetry.append({
+        "type": "order_response",
+        "bot_id": bot_id,
+        "client_id": bot_id,
+        "order_id": oid,
+        "action": sent["action"] if sent else None,
+        "phase": sent["phase"] if sent else current_phase,
+        "msg_type": mtype,
+        "message_code": item.get("message_code"),
+        "latency_ns": (t_recv - sent["t_send_ns"]) if sent else None,
+        "t_send_ns": sent["t_send_ns"] if sent else None,
+        "t_recv_ns": t_recv,
+        "error": item.get("error", ""),
+        "sequence_number": item.get("sequence_number"),
+        "trades": item.get("trades", []),
+        "orders": item.get("orders", []),
+    })
+
+    if mtype in _TERMINAL_TYPES:
+        generator.remove_active_order(oid)
+        for trade in item.get("trades", []):
+            for key in ("buyer_order_id", "seller_order_id"):
+                other = trade.get(key)
+                if other and other != oid:
+                    generator.remove_active_order(other)
+                    pending.pop(other, None)
+
+
+def _extract_oid(item):
+    if "order_id" in item:
+        return item["order_id"]
+    orders = item.get("orders") or []
+    if orders and isinstance(orders[0], dict):
+        return orders[0].get("order_id")
+    return None
+
+
+# ────────────────────────── plotting ─────────────────────────────────────────
+
+def _plot_book_on(ax, book, fair_value, title, show_trades=False):
+    if book.bids:
+        bx = sorted(book.bids)
+        by = [book.bids[p] for p in bx]
+        ax.bar(bx, by, color="green", alpha=0.7, label=f"bids ({sum(by)} qty)", width=1.0)
+    if book.asks:
+        ax_x = sorted(book.asks)
+        ay = [book.asks[p] for p in ax_x]
+        ax.bar(ax_x, ay, color="red", alpha=0.7, label=f"asks ({sum(ay)} qty)", width=1.0)
+    if show_trades and book.trades:
+        agg: dict[int, int] = defaultdict(int)
+        for p, q in book.trades:
+            agg[p] += q
+        tx = list(agg.keys())
+        ty = [0] * len(tx)
+        sizes = [max(20, agg[p]) for p in tx]
+        ax.scatter(tx, ty, s=sizes, color="blue", alpha=0.4,
+                   label=f"trades ({len(book.trades)})", zorder=5)
+    ax.axvline(fair_value, color="black", linestyle="--", linewidth=1,
+               label=f"fair_value={fair_value}")
+    ax.set_title(title)
+    ax.set_ylabel("qty at price")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+def plot_phase_compare(phase, fleet_book: FleetBook, submitted_book: SubmittedBook,
+                       fair_value: int, counts: Counter):
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    total_sent = sum(counts.values())
+    new = counts.get("new_order", 0)
+    can = counts.get("cancel", 0)
+    mod = counts.get("modify", 0)
+    _plot_book_on(
+        ax_top, submitted_book, fair_value,
+        f"SUBMITTED (no matching applied)  |  sent={total_sent}  "
+        f"new={new}  cancel={can}  modify={mod}  resting={len(submitted_book.resting)}",
+    )
+    _plot_book_on(
+        ax_bot, fleet_book, fair_value,
+        f"ENGINE TRUTH (after matching)  |  resting={len(fleet_book.resting)}  "
+        f"trades_this_phase={len(fleet_book.trades)}",
+        show_trades=True,
+    )
+    ax_bot.set_xlabel("price")
+    fig.suptitle(f"Phase: {phase}", fontsize=14, fontweight="bold")
+
+    os.makedirs("results", exist_ok=True)
+    out = os.path.join("results", f"live_book_shape_{phase}.png")
+    plt.tight_layout()
+    plt.savefig(out, dpi=110)
+    plt.close(fig)
+    print(f"   -> wrote {out}")
 
 
 # ────────────────────────── per-bot driver ───────────────────────────────────
 
-async def run_bot(bot_id: int, plan: list, book: FleetBook,
-                  barrier1: asyncio.Barrier, barrier2: asyncio.Barrier,
-                  generators_out: dict[int, OrderGenerator]):
+async def run_bot(bot_id, plan, fleet_book, submitted_book,
+                  barrier1, barrier2, generators_out, fleet_counts):
     pending: dict = {}
     telemetry: list = []
 
     first_cfg = dataclasses.replace(
         PHASE_CONFIGS[plan[0][0]],
-        seed=GLOBAL_SEED + bot_id * 100,
-        total_orders=ORDERS_PER_BOT_PER_PHASE,
+        seed=GLOBAL_SEED * 1000 + bot_id,
+        total_orders=max(1, PHASE_CONFIGS[plan[0][0]].total_orders // NUM_BOTS),
     )
     generator = OrderGenerator(bot_id, first_cfg)
     generators_out[bot_id] = generator
@@ -251,67 +382,51 @@ async def run_bot(bot_id: int, plan: list, book: FleetBook,
             for phase_name, rate in plan:
                 cfg = dataclasses.replace(
                     PHASE_CONFIGS[phase_name],
-                    seed=GLOBAL_SEED + bot_id * 100,
-                    total_orders=ORDERS_PER_BOT_PER_PHASE,
+                    seed=GLOBAL_SEED * 1000 + bot_id,
+                    total_orders=max(1, PHASE_CONFIGS[phase_name].total_orders // NUM_BOTS),
                 )
                 generator.update_config(cfg)
                 done = asyncio.Event()
                 print(f"[bot {bot_id}] phase '{phase_name}' at {rate}/s")
                 try:
                     await asyncio.gather(
-                        sender_loop(ws, generator, pending, rate, done, bot_id, phase_name),
-                        receiver_loop(ws, pending, telemetry, done, bot_id, phase_name, book),
+                        sender_loop(ws, generator, pending, rate, done,
+                                    bot_id, phase_name, telemetry, submitted_book,
+                                    fleet_counts),
+                        receiver_loop(ws, pending, telemetry, done,
+                                      bot_id, phase_name, fleet_book, generator),
                     )
                 except Exception as e:
                     print(f"[bot {bot_id}] phase '{phase_name}' error: {e!r}")
                     barrier1.abort(); barrier2.abort()
                     raise
 
-                # sync barrier 1: all bots done with phase
                 await barrier1.wait()
-                # bot 1 plots + resets phase trades
                 if bot_id == 1:
                     try:
                         gens = [generators_out[i] for i in sorted(generators_out)]
-                        counts = _approx_counts_from_book(book)
-                        print_summary(phase_name, counts, book, gens)
-                        plot_phase(phase_name, book, cfg.fair_value, gens, counts)
-                        # rename to live_book_shape_*.png
-                        _rename_to_live(phase_name)
+                        # summary: lean on what we know — actually-sent counts
+                        print_summary(phase_name, fleet_counts, fleet_book, gens)
+                        plot_phase_compare(phase_name, fleet_book, submitted_book,
+                                           cfg.fair_value, fleet_counts)
                     except Exception as e:
                         print(f"[plot] failed for {phase_name}: {e!r}")
                     finally:
-                        book.reset_phase_trades()
-                # sync barrier 2: plot done, next phase starts
+                        fleet_book.reset_phase_trades()
+                        fleet_counts.clear()
                 await barrier2.wait()
     except Exception as e:
         print(f"[bot {bot_id}] fatal: {e!r}")
-
-
-def _approx_counts_from_book(book: FleetBook) -> Counter:
-    """
-    We don't track per-op counts in live mode (the engine's view is post-match).
-    Surface what we know: resting count + trades count.
-    """
-    c: Counter = Counter()
-    c["resting"] = len(book.resting)
-    c["trades"] = len(book.trades)
-    return c
-
-
-def _rename_to_live(phase: str):
-    import os
-    src = f"book_shape_{phase}.png"
-    dst = f"live_book_shape_{phase}.png"
-    if os.path.exists(src):
-        if os.path.exists(dst):
-            os.remove(dst)
-        os.rename(src, dst)
+    finally:
+        print(f"[bot {bot_id}] done. telemetry_events={len(telemetry)} "
+              f"pending_left={len(pending)}")
 
 
 async def main():
     plan = TEST_PLANS[PLAN_NAME]
-    book = FleetBook()
+    fleet_book = FleetBook()
+    submitted_book = SubmittedBook()
+    fleet_counts: Counter = Counter()
     barrier1 = asyncio.Barrier(NUM_BOTS)
     barrier2 = asyncio.Barrier(NUM_BOTS)
     generators_out: dict[int, OrderGenerator] = {}
@@ -319,7 +434,8 @@ async def main():
     print(f"launching {NUM_BOTS} bots on plan '{PLAN_NAME}' against {URI}")
     try:
         await asyncio.gather(*[
-            run_bot(bot_id, plan, book, barrier1, barrier2, generators_out)
+            run_bot(bot_id, plan, fleet_book, submitted_book,
+                    barrier1, barrier2, generators_out, fleet_counts)
             for bot_id in range(1, NUM_BOTS + 1)
         ])
     except Exception as e:

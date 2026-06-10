@@ -16,6 +16,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "build_book": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=1.0,
         aggressive_new_orders=0.0,
         cancel_orders=0.0,
@@ -43,6 +45,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "light_mixed": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.50,
         aggressive_new_orders=0.10,
         cancel_orders=0.30,
@@ -68,6 +72,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "heavy_mixed": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.50,
         aggressive_new_orders=0.10,
         cancel_orders=0.30,
@@ -95,6 +101,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "cancel_storm": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.10,
         aggressive_new_orders=0.05,
         cancel_orders=0.80,
@@ -123,6 +131,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "matching_spike": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.10,
         aggressive_new_orders=0.70,
         cancel_orders=0.10,
@@ -150,6 +160,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "wide_book": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.60,
         aggressive_new_orders=0.10,
         cancel_orders=0.20,
@@ -176,6 +188,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "tight_book": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.60,
         aggressive_new_orders=0.10,
         cancel_orders=0.20,
@@ -202,6 +216,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "buy_pressure": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.50,
         aggressive_new_orders=0.10,
         cancel_orders=0.30,
@@ -227,6 +243,8 @@ PHASE_CONFIGS = {
     # ──────────────────────────────────────────────
     "recovery": GeneratorConfig(
         seed=42,
+        min_symbol=1,
+        max_symbol=100,
         passive_new_orders=0.50,
         aggressive_new_orders=0.10,
         cancel_orders=0.30,

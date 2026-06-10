@@ -221,3 +221,5 @@ __marimo__/
 *.png
 BOT_FLEET_README.md
 PROJECT_README.md
+
+.claude
