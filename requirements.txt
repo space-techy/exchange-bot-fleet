@@ -1,2 +1,6 @@
 websockets
 matplotlib
+
+# Optional — only needed for the distributed backends:
+confluent-kafka   # TELEMETRY_SINK=kafka
+redis             # PHASE_SOURCE=redis
