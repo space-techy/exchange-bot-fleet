@@ -20,12 +20,42 @@ reshape. The hot path is lean enough for the load levels this targets; the desig
 leaves clean seams (pluggable telemetry sink, pluggable phase source) to swap in
 heavier infrastructure later.
 
+## Project layout
+
+Everything lives in the `botfleet` package, grouped by what it does, with thin
+entrypoint scripts at the repo root:
+
+```
+run_fleet.py                  → botfleet.runtime.fleet      (production pod)
+run_live_visualizer.py        → botfleet.visualization.live (live debug view)
+run_offline_visualizer.py     → botfleet.visualization.offline (local sim)
+
+botfleet/
+  core/           the domain — "what to send"
+    config.py       GeneratorConfig (every generation knob)
+    generator.py    OrderGenerator (deterministic order stream)
+    plans.py        PHASE_CONFIGS + TEST_PLANS (scenarios & sequencing)
+  runtime/        the production fleet — "send it for real"
+    settings.py     env-driven config (engine URI, seed, flush, ...)
+    telemetry.py    pluggable sinks + buffering collector
+    coordination.py pluggable phase coordinators (local / Redis stub)
+    protocol.py     engine-response handling (latency, generator sync)
+    loops.py        async sender / receiver hot loops
+    fleet.py        per-bot driver + CLI
+  visualization/  the debug tools — "see what happened"
+    books.py        LocalBook / FleetBook / SubmittedBook
+    summary.py      shared per-phase text summary
+    plots.py        matplotlib chart helpers
+    offline.py      offline visualizer (local sim, no network)
+    live.py         live visualizer (drives the fleet, rebuilds the book)
+```
+
 ## The two programs
 
-| File | What it's for |
+| Command | What it's for |
 |------|---------------|
-| **`bot_runner.py`** | The production fleet. Silent, lean. Sends orders, collects telemetry, ships it to a sink. No prints, no plotting. |
-| **`live_visualizer.py`** | The debugging lens. Runs the same traffic but rebuilds the order book from the engine's replies and draws a chart per phase so you can *see* what the engine did. Use this locally to inspect behaviour and results. |
+| **`python run_fleet.py`** | The production fleet. Silent, lean. Sends orders, collects telemetry, ships it to a sink. No prints, no plotting. |
+| **`python run_live_visualizer.py`** | The debugging lens. Runs the same traffic but rebuilds the order book from the engine's replies and draws a chart per phase so you can *see* what the engine did. Use this locally to inspect behaviour and results. |
 
 Both drive the **same** order generator and the same test plans — so what you see
 in the visualizer is what the production fleet sends.
@@ -68,7 +98,7 @@ orders on the other side — a bigger overshoot sweeps deeper into the book.
 
 There are three layers, from the smallest knob to the whole run.
 
-### `GeneratorConfig` (in `order_generator.py`)
+### `GeneratorConfig` (in `botfleet/core/config.py`)
 
 A dataclass holding **every knob** that shapes order generation. The important ones:
 
@@ -90,7 +120,7 @@ A dataclass holding **every knob** that shapes order generation. The important o
   per-pod by the runner (see Pods below), not in the phase config, so every order a
   bot sends — including its cancels and modifies — carries the same symbol.
 
-### `OrderGenerator` (in `order_generator.py`)
+### `OrderGenerator` (in `botfleet/core/generator.py`)
 
 The black box that turns a `GeneratorConfig` into orders, one at a time, via
 `generate_next()`. It is **deterministic**: the same config + same seed always
@@ -100,7 +130,7 @@ cancels or modifies orders that actually exist — and the receiver keeps that v
 in sync with the engine's truth (orders the engine says are filled/cancelled get
 dropped).
 
-### `PHASE_CONFIGS` and `TEST_PLANS` (in `configs.py`)
+### `PHASE_CONFIGS` and `TEST_PLANS` (in `botfleet/core/plans.py`)
 
 - **`PHASE_CONFIGS`** is a catalogue of named, ready-made `GeneratorConfig`s — each
   one a deliberate stress scenario. See the table below.
@@ -126,7 +156,7 @@ dropped).
 
 ### Pods: one symbol, two dials, an identity
 
-A **pod** is one run of `bot_runner.py` — a fleet of bots all trading **one symbol**.
+A **pod** is one run of `run_fleet.py` — a fleet of bots all trading **one symbol**.
 It's the unit of load you point at a single book, and it has four knobs:
 
 - **`--symbol`** — the one book every bot in the pod hammers.
@@ -159,10 +189,10 @@ Have your matching engine listening for WebSocket connections (default
 
 ```bash
 # pod targeting symbol 2, 5 bots, full volume
-python bot_runner.py --plan standard --symbol 2 --num-bots 5
+python run_fleet.py --plan standard --symbol 2 --num-bots 5
 
 # a lighter pod on symbol 7: 1/6 the orders
-python bot_runner.py --plan standard --symbol 7 --num-bots 5 --order-divisor 6 --pod-id 1
+python run_fleet.py --plan standard --symbol 7 --num-bots 5 --order-divisor 6 --pod-id 1
 ```
 
 It runs silently and streams telemetry to the configured sink. Every flag has an
@@ -182,17 +212,23 @@ env-var equivalent:
 | `FLUSH_INTERVAL_S` | `1.0` | How often telemetry is flushed even at low rate. |
 | `TEST_ID` | `local` | Identifier reserved for the future Redis/Kafka keys. |
 
-**Run the visualizer:**
+**Run the live visualizer:**
 
-Edit the constants at the top of `live_visualizer.py` (`URI`, `NUM_BOTS`,
-`PLAN_NAME`, `GLOBAL_SEED`, and `SYMBOL`/`ORDER_DIVISOR`/`POD_ID`), then:
+Edit the constants at the top of `botfleet/visualization/live.py` (`URI`,
+`NUM_BOTS`, `PLAN_NAME`, `GLOBAL_SEED`, and `SYMBOL`/`ORDER_DIVISOR`/`POD_ID`), then:
 
 ```bash
-python live_visualizer.py
+python run_live_visualizer.py
 ```
 
 It writes one chart per phase into `results/`. Because the whole run trades one
 `SYMBOL`, the reconstructed book is exactly that one book.
+
+**Run the offline visualizer** (local sim, no engine needed):
+
+```bash
+python run_offline_visualizer.py
+```
 
 ## Scaling & how much load is "real" stress
 

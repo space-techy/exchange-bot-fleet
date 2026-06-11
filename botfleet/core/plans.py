@@ -1,6 +1,7 @@
-# configs.py
+"""PHASE_CONFIGS and TEST_PLANS — the catalogue of stress scenarios and how to
+sequence them into a run."""
 
-from order_generator import GeneratorConfig
+from botfleet.core.config import GeneratorConfig
 
 PHASE_CONFIGS = {
 
@@ -47,7 +48,7 @@ PHASE_CONFIGS = {
         aggressive_new_orders=0.10,
         cancel_orders=0.30,
         modify_orders=0.10,
-        total_orders=1000,
+        total_orders=10000,
         offset_lambda=0.2,
         price_distribution="squared",
         max_price_deviation=50,

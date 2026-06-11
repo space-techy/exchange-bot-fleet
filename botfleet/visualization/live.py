@@ -11,27 +11,24 @@ TWO-PANEL matplotlib chart + text summary:
 The gap between the two visualises the matching activity for that phase:
 how much of the submitted depth got consumed, where it got consumed.
 
-Run: python live_visualizer.py     (engine must be at ws://localhost:3001/ws)
-Outputs: live_book_shape_<phase>.png + stdout summary
+Engine must be at ws://localhost:3001/ws.
+Outputs: results/live_book_shape_<phase>.png + stdout summary
 """
 
 import asyncio
 import dataclasses
 import json
-import os
 import time
-from collections import defaultdict, Counter
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from collections import Counter
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from configs import PHASE_CONFIGS, TEST_PLANS
-from order_generator import OrderGenerator
-from visualizer import print_summary
+from botfleet.core.generator import OrderGenerator
+from botfleet.core.plans import PHASE_CONFIGS, TEST_PLANS
+from botfleet.visualization.books import FleetBook, SubmittedBook
+from botfleet.visualization.plots import plot_phase_compare
+from botfleet.visualization.summary import print_summary
 
 
 URI = "ws://localhost:3001/ws"
@@ -44,140 +41,6 @@ PLAN_NAME = "standard"
 SYMBOL = 1
 ORDER_DIVISOR = 1        # divide every phase's total_orders (volume dial)
 POD_ID = 0               # offsets client_id/order_id; keep 0 for a standalone run
-
-
-# ─────────────────────────── books ──────────────────────────────────────────
-
-class FleetBook:
-    """Engine truth, built from every response message via handle()."""
-
-    def __init__(self):
-        self.bids: dict[int, int] = defaultdict(int)
-        self.asks: dict[int, int] = defaultdict(int)
-        self.resting: dict[int, dict] = {}
-        self.trades: list[tuple[int, int]] = []          # per-phase
-
-    def reset_phase_trades(self):
-        self.trades = []
-
-    def best_bid(self) -> int | None:
-        return max(self.bids) if self.bids else None
-
-    def best_ask(self) -> int | None:
-        return min(self.asks) if self.asks else None
-
-    def handle(self, msg: dict):
-        """Engine truth update. Same envelope for everything — aggressor responses
-        AND resting-side fill events. We just trust orders[].remaining_qty."""
-        if not isinstance(msg, dict):
-            return
-        mtype = msg.get("type")
-
-        if mtype in ("trade_broadcast", "order_rejected"):
-            return
-
-        if mtype in ("partial_fill", "order_filled"):
-            for t in msg.get("trades", []):
-                p, q = t.get("price"), t.get("qty")
-                if p is not None and q is not None:
-                    self.trades.append((p, q))
-
-        for o in msg.get("orders", []):
-            oid = o.get("order_id")
-            if oid is None:
-                continue
-            if mtype == "order_cancelled":
-                self._remove(oid)
-                continue
-            self._upsert(
-                oid=oid, side=o.get("side"), price=o.get("price"),
-                remaining_qty=o.get("remaining_qty", 0),
-            )
-
-    def _upsert(self, oid, side, price, remaining_qty):
-        prev = self.resting.get(oid)
-        if remaining_qty <= 0:
-            self._remove(oid)
-            return
-        if side is None and prev is not None:
-            side = prev["side"]
-        if price is None and prev is not None:
-            price = prev["price"]
-        if side is None or price is None:
-            return
-        book = self.bids if side == "buy" else self.asks
-        if prev is None:
-            book[price] += remaining_qty
-            self.resting[oid] = {"side": side, "price": price, "qty": remaining_qty}
-        else:
-            delta = remaining_qty - prev["qty"]
-            book[prev["price"]] += delta
-            if book[prev["price"]] <= 0:
-                del book[prev["price"]]
-            prev["qty"] = remaining_qty
-
-    def _remove(self, oid):
-        prev = self.resting.pop(oid, None)
-        if prev is None:
-            return
-        book = self.bids if prev["side"] == "buy" else self.asks
-        book[prev["price"]] -= prev["qty"]
-        if book[prev["price"]] <= 0:
-            del book[prev["price"]]
-
-
-class SubmittedBook:
-    """
-    Fleet intent. Built from the sender side. Every new_order adds to the book,
-    every cancel removes, every modify adjusts. NO MATCHING is ever applied —
-    so aggressive orders just sit at their crossing price.
-
-    Comparing this to FleetBook reveals what the matching engine consumed.
-    """
-
-    def __init__(self):
-        self.bids: dict[int, int] = defaultdict(int)
-        self.asks: dict[int, int] = defaultdict(int)
-        self.resting: dict[int, dict] = {}
-        self.trades: list = []          # always empty, kept for duck-type compat
-
-    def reset_phase_trades(self):
-        pass
-
-    def best_bid(self) -> int | None:
-        return max(self.bids) if self.bids else None
-
-    def best_ask(self) -> int | None:
-        return min(self.asks) if self.asks else None
-
-    def apply_sent(self, order: dict):
-        action = order["action"]
-        oid = order["order_id"]
-        if action == "new_order":
-            side, price, qty = order["side"], order["price"], order["qty"]
-            book = self.bids if side == "buy" else self.asks
-            book[price] += qty
-            self.resting[oid] = {"side": side, "price": price, "qty": qty}
-        elif action == "cancel":
-            prev = self.resting.pop(oid, None)
-            if prev is None:
-                return
-            book = self.bids if prev["side"] == "buy" else self.asks
-            book[prev["price"]] -= prev["qty"]
-            if book[prev["price"]] <= 0:
-                del book[prev["price"]]
-        elif action == "modify":
-            prev = self.resting.get(oid)
-            if prev is None:
-                return
-            new_qty = order["qty"]
-            delta = new_qty - prev["qty"]
-            book = self.bids if prev["side"] == "buy" else self.asks
-            book[prev["price"]] += delta
-            prev["qty"] = new_qty
-            if book[prev["price"]] <= 0:
-                del book[prev["price"]]
-                self.resting.pop(oid, None)
 
 
 # ─────────────────────────── sender / receiver ───────────────────────────────
@@ -308,64 +171,6 @@ def _extract_oid(item):
     if orders and isinstance(orders[0], dict):
         return orders[0].get("order_id")
     return None
-
-
-# ────────────────────────── plotting ─────────────────────────────────────────
-
-def _plot_book_on(ax, book, fair_value, title, show_trades=False):
-    if book.bids:
-        bx = sorted(book.bids)
-        by = [book.bids[p] for p in bx]
-        ax.bar(bx, by, color="green", alpha=0.7, label=f"bids ({sum(by)} qty)", width=1.0)
-    if book.asks:
-        ax_x = sorted(book.asks)
-        ay = [book.asks[p] for p in ax_x]
-        ax.bar(ax_x, ay, color="red", alpha=0.7, label=f"asks ({sum(ay)} qty)", width=1.0)
-    if show_trades and book.trades:
-        agg: dict[int, int] = defaultdict(int)
-        for p, q in book.trades:
-            agg[p] += q
-        tx = list(agg.keys())
-        ty = [0] * len(tx)
-        sizes = [max(20, agg[p]) for p in tx]
-        ax.scatter(tx, ty, s=sizes, color="blue", alpha=0.4,
-                   label=f"trades ({len(book.trades)})", zorder=5)
-    ax.axvline(fair_value, color="black", linestyle="--", linewidth=1,
-               label=f"fair_value={fair_value}")
-    ax.set_title(title)
-    ax.set_ylabel("qty at price")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-
-def plot_phase_compare(phase, fleet_book: FleetBook, submitted_book: SubmittedBook,
-                       fair_value: int, counts: Counter):
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-
-    total_sent = sum(counts.values())
-    new = counts.get("new_order", 0)
-    can = counts.get("cancel", 0)
-    mod = counts.get("modify", 0)
-    _plot_book_on(
-        ax_top, submitted_book, fair_value,
-        f"SUBMITTED (no matching applied)  |  sent={total_sent}  "
-        f"new={new}  cancel={can}  modify={mod}  resting={len(submitted_book.resting)}",
-    )
-    _plot_book_on(
-        ax_bot, fleet_book, fair_value,
-        f"ENGINE TRUTH (after matching)  |  resting={len(fleet_book.resting)}  "
-        f"trades_this_phase={len(fleet_book.trades)}",
-        show_trades=True,
-    )
-    ax_bot.set_xlabel("price")
-    fig.suptitle(f"Phase: {phase}", fontsize=14, fontweight="bold")
-
-    os.makedirs("results", exist_ok=True)
-    out = os.path.join("results", f"live_book_shape_{phase}.png")
-    plt.tight_layout()
-    plt.savefig(out, dpi=110)
-    plt.close(fig)
-    print(f"   -> wrote {out}")
 
 
 # ────────────────────────── per-bot driver ───────────────────────────────────
