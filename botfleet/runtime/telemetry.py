@@ -111,7 +111,7 @@ class KafkaSink(TelemetrySink):
 
 
 def make_sink(bot_id: int) -> TelemetrySink:
-    kind = os.environ.get("TELEMETRY_SINK", "file").lower()
+    kind = os.environ.get("TELEMETRY_SINK", "kafka").lower()
     if kind == "kafka":
         return KafkaSink(bot_id)
     return FileSink(bot_id)

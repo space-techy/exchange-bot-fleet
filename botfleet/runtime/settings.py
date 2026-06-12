@@ -8,7 +8,7 @@ GLOBAL_SEED = int(os.environ.get("GLOBAL_SEED", "42"))
 # Identifies a contestant submission (team name + id). Used as the suffix on the
 # Kafka topics and the prefix on the Redis keys, so every pod of a submission
 # reads/writes the same place.
-TEST_ID = os.environ.get("TEST_ID", "local")
+TEST_ID = os.environ.get("TEST_ID", "local_1")
 
 FLUSH_INTERVAL_S = float(os.environ.get("FLUSH_INTERVAL_S", "1.0"))
 
