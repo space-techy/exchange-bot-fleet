@@ -262,7 +262,7 @@ TEST_PLANS = {
 
     # Quick smoke test: ~2 minutes, basic validation
     "quick": [
-        # ("build_book", 200),
+        ("build_book", 200),
         ("light_mixed", 100),
     ],
 

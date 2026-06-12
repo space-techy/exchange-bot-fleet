@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from collections import deque
 
 from websockets.exceptions import ConnectionClosed
 
@@ -37,11 +38,15 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
             order = generator.generate_next()
             t_send = time.monotonic_ns()
             oid = order["order_id"]
-            pending[oid] = {
+            # A new_order, its later modify(s) and its cancel all SHARE one
+            # order_id. Responses on this single connection come back in send
+            # order, so queue per-oid and pair FIFO — never overwrite, or a
+            # response would inherit the wrong action and one send go unanswered.
+            pending.setdefault(oid, deque()).append({
                 "t_send_ns": t_send,
                 "action": order["action"],
                 "phase": phase,
-            }
+            })
             await ws.send(json.dumps(order))
             sent += 1
 
