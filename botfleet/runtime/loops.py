@@ -54,7 +54,6 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
                 "price": order.get("price"),
                 "qty": order.get("qty"),
                 "symbol": order.get("symbol"),
-                "phase": phase,
                 "t_send_ns": t_send,
             })
 
@@ -69,11 +68,9 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
 
 
 async def receiver_loop(ws, pending: dict, telemetry: TelemetryCollector,
-                        generator: OrderGenerator, done: asyncio.Event,
-                        phase: str):
-    """Match responses, record latency, sync the generator's active_orders.
-    `phase` is the bot's CURRENT phase — used to label resting-side fills that
-    don't carry their original phase context."""
+                        generator: OrderGenerator, done: asyncio.Event):
+    """Record latency for the engine's replies to our own requests, sync the
+    generator's active_orders, and discard unsolicited resting-side fills."""
     while True:
         try:
             timeout = 2.0 if done.is_set() else 15.0
@@ -95,4 +92,4 @@ async def receiver_loop(ws, pending: dict, telemetry: TelemetryCollector,
         for item in items:
             if not isinstance(item, dict):
                 continue
-            handle_item(item, t_recv, pending, telemetry, generator, phase)
+            handle_item(item, t_recv, pending, telemetry, generator)

@@ -78,7 +78,7 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
                     await asyncio.gather(
                         sender_loop(ws, generator, pending, rate, done, coord,
                                     phase_name, telemetry, stop_event),
-                        receiver_loop(ws, pending, telemetry, generator, done, phase_name),
+                        receiver_loop(ws, pending, telemetry, generator, done),
                     )
                 except ConnectionClosed:
                     break                       # engine dropped — end this bot

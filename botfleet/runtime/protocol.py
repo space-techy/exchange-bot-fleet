@@ -1,8 +1,15 @@
 """Engine-response handling for the production fleet.
 
 One unified envelope shape covers every order event. `handle_item` records a
-telemetry row, computes latency for our own requests, and keeps the generator's
-view of live orders in sync with the engine's truth.
+telemetry row for the engine's reply to OUR request (with a real latency), and
+keeps the generator's view of live orders in sync with the engine's truth.
+
+Unsolicited resting-side fills (someone else's aggressor hit one of our resting
+orders) are deliberately DISCARDED, not recorded: the same trade is already
+captured in the aggressor's response, which is what the validator replays. So
+recording the resting notice would just duplicate that data — and would make a
+`sequence_number` show up in more than one telemetry row. We only sync generator
+state for those and move on.
 """
 
 from botfleet.core.generator import OrderGenerator
@@ -13,8 +20,7 @@ TERMINAL_TYPES = ("order_filled", "order_cancelled", "order_rejected")
 
 
 def handle_item(item: dict, t_recv: int, pending: dict,
-                telemetry: TelemetryCollector, generator: OrderGenerator,
-                current_phase: str):
+                telemetry: TelemetryCollector, generator: OrderGenerator):
     mtype = item.get("type")
 
     if mtype == "trade_broadcast":
@@ -25,17 +31,22 @@ def handle_item(item: dict, t_recv: int, pending: dict,
         return
 
     sent = pending.pop(oid, None)
+    if sent is None:
+        # Unsolicited resting-side fill — redundant with the aggressor's response.
+        # Don't record; just keep our generator's live-order view in sync.
+        generator.remove_active_order(oid)
+        return
 
+    # Direct response to a request we sent — always carries a real latency.
     telemetry.record({
         "type": "order_response",
         "client_id": generator.client_id,
         "order_id": oid,
-        "action": sent["action"] if sent else None,
-        "phase": sent["phase"] if sent else current_phase,
+        "action": sent["action"],
         "msg_type": mtype,
         "message_code": item.get("message_code"),
-        "latency_ns": (t_recv - sent["t_send_ns"]) if sent else None,
-        "t_send_ns": sent["t_send_ns"] if sent else None,
+        "latency_ns": t_recv - sent["t_send_ns"],
+        "t_send_ns": sent["t_send_ns"],
         "t_recv_ns": t_recv,
         "error": item.get("error", ""),
         "sequence_number": item.get("sequence_number"),
@@ -45,8 +56,8 @@ def handle_item(item: dict, t_recv: int, pending: dict,
 
     if mtype in TERMINAL_TYPES:
         generator.remove_active_order(oid)
-        # Clean up the other side of the trade from our generator (in case we
-        # placed both sides, or a resting order of ours was the counterparty).
+        # If a resting order of ours was the counterparty, retire it now from the
+        # trade data (its own resting-fill notice is discarded above).
         for trade in item.get("trades", []):
             for key in ("buyer_order_id", "seller_order_id"):
                 other = trade.get(key)
