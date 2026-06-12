@@ -91,7 +91,9 @@ class KafkaSink(TelemetrySink):
     def write_batch(self, events):
         for ev in events:
             topic = self.sent_topic if ev.get("type") == "order_sent" else self.response_topic
-            key = ev.get("order_id")
+            # Key by the request's ticket so a request's order_sent and its
+            # order_response land on the same partition, in order.
+            key = ev.get("client_order_id")
             self._produce(topic, key, json.dumps(ev))
         # serve delivery callbacks and free the queue (non-blocking)
         self.producer.poll(0)

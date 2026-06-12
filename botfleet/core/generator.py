@@ -34,23 +34,20 @@ class OrderGenerator:
         # one mean-reverting price walk for this bot's single symbol
         self.ref_price = config.start_price
 
-        # Order Tracking — client_id is the global index; order_ids live in this
-        # bot's own 100M-wide range so they never overlap another (pod, bot).
+        # Order Tracking — client_id is the global index.
         self.client_id = global_bot
 
-        # TODO to make order independent of order id by adding client id
-        # - Add client_order_id field to Message struct (what the client sends)
-        # - Engine generates its own internal order_id (atomic counter, simple increment)
-        # - Engine stores mapping: internal_order_id ↔ {client_id, client_order_id}
-        # - All internal book operations use engine's order_id (faster: simple integer, no composite key)
-        # - All responses include BOTH: {"order_id": 847291, "client_order_id": 1000042, "client_id": 1}
-        # - Bot matches responses using client_order_id (which it generated)
-        # - Validator can use either ID for matching
-        # TODO end
+        # client_order_id: a fresh ticket for EVERY request (new_order, cancel
+        # AND modify each get their own). The engine echoes it on the direct
+        # response (and omits it on unsolicited notices), so response pairing
+        # is an exact lookup — no inference. Each (pod, bot) owns a disjoint
+        # 100M-wide range, so ids never collide or repeat across the fleet.
+        # The engine names book orders with its own internal order_id; we
+        # reference an order by the client_order_id of the new_order that
+        # created it (target_client_order_id on cancel/modify).
+        self.next_client_order_id = global_bot * 100_000_000
 
-        self.next_order_id = global_bot * 100_000_000
-
-        # order_id → {side, price, qty}
+        # client_order_id of the creating new_order → {side, price, qty}
         self.active_orders : dict[ int, dict] = {}
 
         # Counters
@@ -70,10 +67,11 @@ class OrderGenerator:
     def get_active_order_count(self) -> int:
         return len(self.active_orders)
 
-    def remove_active_order(self, oid: int) -> bool:
-        """Drop an order the engine told us is gone (fully filled / cancelled / rejected).
+    def remove_active_order(self, client_order_id: int) -> bool:
+        """Drop an order the engine told us is gone (fully filled / cancelled / rejected),
+        identified by the client_order_id of the new_order that created it.
         Keeps the generator's view in sync so future cancel/modify ops target live orders only."""
-        return self.active_orders.pop(oid, None) is not None
+        return self.active_orders.pop(client_order_id, None) is not None
 
 
     def generate_next(self) -> dict:
@@ -152,10 +150,10 @@ class OrderGenerator:
         else:
             return self.rng.randint(self.config.qty_min, self.config.qty_max)
 
-    def _next_oid(self) -> int:
-        oid = self.next_order_id
-        self.next_order_id+=1
-        return oid
+    def _next_client_order_id(self) -> int:
+        client_order_id = self.next_client_order_id
+        self.next_client_order_id += 1
+        return client_order_id
 
     def _make_passive_order(self) -> dict:
         """Order placed AWAY from mid — will rest in book."""
@@ -170,15 +168,15 @@ class OrderGenerator:
 
         price = max(1, price)
         qty = self._sample_qty()
-        oid = self._next_oid()
+        client_order_id = self._next_client_order_id()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
+        self.active_orders[client_order_id] = {"side" : side, "qty" : qty, "price": price}
 
         return {
             "action": "new_order",
             "client_id": self.client_id,
             "symbol" : self.config.symbol,
-            "order_id": oid,
+            "client_order_id": client_order_id,
             "side" : side,
             "qty" : qty,
             "price": price
@@ -197,14 +195,14 @@ class OrderGenerator:
 
         price = max(1, price)
         qty = self._sample_qty()
-        oid = self._next_oid()
+        client_order_id = self._next_client_order_id()
 
-        self.active_orders[oid] = {"side" : side, "qty" : qty, "price": price}
+        self.active_orders[client_order_id] = {"side" : side, "qty" : qty, "price": price}
 
         return {
             "action": "new_order",
             "client_id": self.client_id,
-            "order_id": oid,
+            "client_order_id": client_order_id,
             "symbol": self.config.symbol,
             "side": side,
             "price": price,
@@ -212,27 +210,31 @@ class OrderGenerator:
         }
 
     def _make_cancel(self) -> dict:
-        """Cancel a random active order."""
-        oid = self.rng.choice(list(self.active_orders.keys()))
-        del self.active_orders[oid]
+        """Cancel a random active order. The request gets its OWN fresh
+        client_order_id; the order it targets is named separately."""
+        target = self.rng.choice(list(self.active_orders.keys()))
+        del self.active_orders[target]
         return {
             "action": "cancel",
             "client_id": self.client_id,
-            "order_id": oid,
+            "client_order_id": self._next_client_order_id(),
+            "target_client_order_id": target,
             "symbol": self.config.symbol
         }
 
     def _make_modify(self) -> dict:
-        """Modify a random active order — decrease quantity only."""
-        oid = self.rng.choice(list(self.active_orders.keys()))
-        old_qty = self.active_orders[oid]["qty"]
+        """Modify a random active order — decrease quantity only. Fresh
+        client_order_id for the request, target names the order."""
+        target = self.rng.choice(list(self.active_orders.keys()))
+        old_qty = self.active_orders[target]["qty"]
         new_qty = self.rng.randint(1, max(1, old_qty - 1))
-        self.active_orders[oid]["qty"] = new_qty
+        self.active_orders[target]["qty"] = new_qty
 
         return {
             "action": "modify",
             "client_id": self.client_id,
-            "order_id": oid,
+            "client_order_id": self._next_client_order_id(),
+            "target_client_order_id": target,
             "symbol": self.config.symbol,
             "qty": new_qty
         }

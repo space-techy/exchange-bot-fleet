@@ -3,7 +3,6 @@
 import asyncio
 import json
 import time
-from collections import deque
 
 from websockets.exceptions import ConnectionClosed
 
@@ -37,23 +36,25 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
 
             order = generator.generate_next()
             t_send = time.monotonic_ns()
-            oid = order["order_id"]
-            # A new_order, its later modify(s) and its cancel all SHARE one
-            # order_id. Responses on this single connection come back in send
-            # order, so queue per-oid and pair FIFO — never overwrite, or a
-            # response would inherit the wrong action and one send go unanswered.
-            pending.setdefault(oid, deque()).append({
+            # Every request — new_order, cancel AND modify — carries its own
+            # fresh client_order_id, which the engine echoes on the direct
+            # response. Pairing is therefore an exact one-shot lookup; a plain
+            # dict entry per request can never collide or be overwritten.
+            client_order_id = order["client_order_id"]
+            pending[client_order_id] = {
                 "t_send_ns": t_send,
                 "action": order["action"],
+                "target_client_order_id": order.get("target_client_order_id"),
                 "phase": phase,
-            })
+            }
             await ws.send(json.dumps(order))
             sent += 1
 
             telemetry.record({
                 "type": "order_sent",
                 "client_id": order.get("client_id"),
-                "order_id": oid,
+                "client_order_id": client_order_id,
+                "target_client_order_id": order.get("target_client_order_id"),
                 "action": order["action"],
                 "side": order.get("side"),
                 "price": order.get("price"),
