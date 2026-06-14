@@ -50,6 +50,20 @@ def handle_item(item: dict, t_recv: int, pending: dict,
         return
 
     # Direct response to a request we sent — always carries a real latency.
+    #
+    # Reported `latency_ns` is COORDINATED-OMISSION corrected: measured from when
+    # the order was *intended* to be dispatched (fixed-rate schedule), not from
+    # the actual send. A back-pressured sender sends late, so t_send drifts with
+    # the engine's own slowness — measuring from t_send would hide exactly the
+    # latency we care about. Under no back-pressure t_send ≈ t_intended, so the
+    # correction is ~zero. We keep `raw_latency_ns` (pure service time) for
+    # debugging. Clamp at 0 defensively (the first order can send a hair before
+    # its intended instant).
+    t_send = sent["t_send_ns"]
+    t_intended = sent.get("t_intended_ns", t_send)
+    co_latency = t_recv - t_intended
+    if co_latency < 0:
+        co_latency = max(t_recv - t_send, 0)
     telemetry.record({
         "type": "order_response",
         "client_id": generator.client_id,
@@ -57,10 +71,13 @@ def handle_item(item: dict, t_recv: int, pending: dict,
         "target_client_order_id": sent.get("target_client_order_id"),
         "order_id": item.get("order_id"),       # engine's internal book id
         "action": sent["action"],
+        # "phase": sent.get("phase"),
         "msg_type": mtype,
         "message_code": item.get("message_code"),
-        "latency_ns": t_recv - sent["t_send_ns"],
-        "t_send_ns": sent["t_send_ns"],
+        "latency_ns": co_latency,               # CO-corrected — the REPORTED metric
+        "raw_latency_ns": t_recv - t_send,       # pure service time (debug only)
+        "t_send_ns": t_send,
+        "t_intended_ns": t_intended,
         "t_recv_ns": t_recv,
         "error": item.get("error", ""),
         "sequence_number": item.get("sequence_number"),

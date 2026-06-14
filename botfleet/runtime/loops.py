@@ -16,14 +16,25 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
                       rate: int, done: asyncio.Event,
                       coord: PhaseCoordinator, phase: str,
                       telemetry: "TelemetryCollector",
-                      stop_event: asyncio.Event | None = None):
+                      stop_event: asyncio.Event | None = None,
+                      sent_counter=None):
     """Generate at `rate`/sec. Tracks each in `pending` before sending, and
     emits an `order_sent` telemetry event so the validator can replay.
     Polls the coordinator every 100 orders for an out-of-band phase change.
-    Stops promptly (after the current order) when `stop_event` is set."""
+    Stops promptly (after the current order) when `stop_event` is set.
+    Increments `sent_counter` (shared across the pod's bots) for live progress.
+
+    Coordinated-omission correction: we stamp each order with the time it was
+    SUPPOSED to be dispatched under the fixed offered rate —
+    `t_intended = start + i/rate` — so the aggregator can measure latency from
+    when load *should* have arrived, not from when a back-pressured sender finally
+    managed to send it. Without this, a stalled engine hides its own slowness
+    (the classic coordinated-omission blind spot)."""
     interval = 1.0 / rate
+    interval_ns = 1_000_000_000.0 / rate
     sent = 0
-    next_deadline = time.monotonic()
+    start_ns = time.monotonic_ns()
+    next_deadline = start_ns / 1e9  # seconds, same monotonic clock as the pacer
     try:
         while generator.has_more():
             # graceful shutdown: stop sending, let the receiver drain + flush
@@ -35,6 +46,9 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
                 break
 
             order = generator.generate_next()
+            # When this order *should* have left under the fixed rate (the CO
+            # reference), vs. when it actually does (t_send). i == `sent` here.
+            t_intended = start_ns + int(sent * interval_ns)
             t_send = time.monotonic_ns()
             # Every request — new_order, cancel AND modify — carries its own
             # fresh client_order_id, which the engine echoes on the direct
@@ -43,12 +57,15 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
             client_order_id = order["client_order_id"]
             pending[client_order_id] = {
                 "t_send_ns": t_send,
+                "t_intended_ns": t_intended,
                 "action": order["action"],
                 "target_client_order_id": order.get("target_client_order_id"),
                 "phase": phase,
             }
             await ws.send(json.dumps(order))
             sent += 1
+            if sent_counter is not None:
+                sent_counter.n += 1
 
             telemetry.record({
                 "type": "order_sent",
@@ -61,6 +78,7 @@ async def sender_loop(ws, generator: OrderGenerator, pending: dict,
                 "qty": order.get("qty"),
                 "symbol": order.get("symbol"),
                 "t_send_ns": t_send,
+                "t_intended_ns": t_intended,
             })
 
             next_deadline += interval

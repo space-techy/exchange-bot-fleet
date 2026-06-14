@@ -21,6 +21,7 @@ from botfleet.runtime.coordination import (
     make_coordinator,
 )
 from botfleet.runtime.loops import receiver_loop, sender_loop
+from botfleet.runtime.progress import SentCounter, make_pod_progress
 from botfleet.runtime.settings import GLOBAL_SEED, URI
 from botfleet.runtime.telemetry import TelemetryCollector
 
@@ -32,9 +33,24 @@ def _per_bot_total(phase_name: str, num_bots: int, divisor: int) -> int:
     return max(1, pod_total // num_bots)
 
 
+def _pod_total(phase_name: str, divisor: int) -> int:
+    """The whole pod's order target for a single phase (all its bots combined)."""
+    return PHASE_CONFIGS[phase_name].total_orders // max(1, divisor)
+
+
+def _pod_plan_total(plan_name: str, divisor: int) -> int:
+    """The whole pod's order target across the ENTIRE plan — every phase summed.
+    This is the denominator for the live progress bar: the shared SentCounter
+    counts orders cumulatively across all phases, so the target must too (else a
+    pod reads e.g. 31,491 / 5,000 once it's past the first phase)."""
+    return sum(_pod_total(phase_name, divisor)
+               for phase_name, _rate in TEST_PLANS[plan_name])
+
+
 async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
                          symbol: int, divisor: int, pod_id: int,
-                         stop_event: asyncio.Event | None = None):
+                         stop_event: asyncio.Event | None = None,
+                         progress=None, sent_counter: "SentCounter | None" = None):
     pending: dict = {}
     telemetry = TelemetryCollector(bot_id)
     telemetry.start()                       # periodic-flush task
@@ -53,6 +69,10 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
     )
     generator = OrderGenerator(bot_id, first_cfg, pod_id=pod_id)
 
+    # Constant denominator for the live bar: the full plan's per-pod order count.
+    # The SentCounter is cumulative across phases, so the target must be too.
+    plan_total = _pod_plan_total(plan_name, divisor)
+
     try:
         async with websockets.connect(URI) as ws:
             while True:
@@ -64,6 +84,12 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
                 if phase is None:
                     break
                 phase_name, rate = phase
+
+                # Report the phase boundary for the live status page (best-effort).
+                # Target stays the whole-plan total so cumulative sent / target is
+                # a sane 0→100%; the phase NAME still advances each phase.
+                if progress is not None:
+                    progress.set_phase(phase_name, plan_total)
 
                 cfg = dataclasses.replace(
                     PHASE_CONFIGS[phase_name],
@@ -77,7 +103,7 @@ async def run_single_bot(bot_id: int, plan_name: str, num_bots: int,
                 try:
                     await asyncio.gather(
                         sender_loop(ws, generator, pending, rate, done, coord,
-                                    phase_name, telemetry, stop_event),
+                                    phase_name, telemetry, stop_event, sent_counter),
                         receiver_loop(ws, pending, telemetry, generator, done),
                     )
                 except ConnectionClosed:
@@ -115,10 +141,25 @@ async def main(num_bots: int = 5, plan_name: str = "quick",
                symbol: int = 1, divisor: int = 1, pod_id: int = 0):
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)
-    await asyncio.gather(*[
-        run_single_bot(bot_id, plan_name, num_bots, symbol, divisor, pod_id, stop_event)
-        for bot_id in range(1, num_bots + 1)
-    ])
+
+    # One progress reporter per pod, shared by all its bots (best-effort; a no-op
+    # if Redis is unavailable). The shared counter is incremented on every send.
+    progress = make_pod_progress(pod_id, symbol, plan_name, num_bots)
+    progress.start()
+    counter = progress.counter
+
+    ok, err = True, ""
+    try:
+        await asyncio.gather(*[
+            run_single_bot(bot_id, plan_name, num_bots, symbol, divisor, pod_id,
+                           stop_event, progress, counter)
+            for bot_id in range(1, num_bots + 1)
+        ])
+    except Exception as e:
+        ok, err = False, f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        await progress.stop(ok=ok, error=err)
 
 
 def parse_args():

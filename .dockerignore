@@ -1,0 +1,14 @@
+# Keep the build context tiny — the image only needs botfleet/ + run_fleet.py
+.git
+.claude
+__pycache__
+**/__pycache__
+*.pyc
+results
+examples
+*.md
+Dockerfile
+.dockerignore
+.gitignore
+run_live_visualizer.py
+run_offline_visualizer.py
