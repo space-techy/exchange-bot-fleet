@@ -1,5 +1,10 @@
 # Exchange Bot Fleet
 
+> **Part of the [Quant-Force](https://github.com/space-techy/quant-force-infra)
+> platform** (the stress fleet in `test_execution`) — one pod per symbol, driving
+> the phased order flow. The order protocol it speaks is `docs/ENGINE_SPEC.md` in
+> the platform repo.
+
 A modular load generator for order-matching engines. It spins up a fleet of
 async bots that stream **bulk, realistic order traffic** at a matching engine
 over WebSocket, and records what comes back so you can measure how the engine
