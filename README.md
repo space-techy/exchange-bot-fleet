@@ -12,12 +12,52 @@ behaves under different kinds of pressure.
 
 ## Why this exists
 
-I needed a way to fire a large volume of order requests at a matching engine —
-but not random noise. The traffic had to *look* like a real market (orders
-clustered near the mid price, a few whales, a realistic mix of new/cancel/modify),
-and it had to be **highly customizable** so I could dial up one kind of stress at
-a time (a cancel storm, a matching spike, a wide book, etc.) without rewriting
-anything.
+> **The design story is here, and the live-visualizer numbers/charts are in
+> [Results](#results-the-charts) below.** If you only read two sections to
+> understand the fleet, read these two.
+
+**The starting question: what actually stresses a matching engine?** When I read
+up on how matching engines are benchmarked, the same answer kept coming back —
+it's not *which* historical day of market data you replay, it's the **depth and
+shape of the order book** and the **mix of operations** hitting it. Published
+work stress-tests engines with *synthetic* limit-order bursts drawn from a
+power-law depth distribution and explicitly studies "depth sensitivity," because
+depth and distribution are what move the needle. The same sources note that real
+order flow is overwhelmingly **cancellations** — only a few percent of orders
+ever trade — which is why a cancel-heavy phase is a *realistic* stressor, not an
+artificial one.
+
+So the real problem wasn't "send a lot of orders" — it was **"how do you
+manufacture order-book depth, on demand, in the exact shape you want?"** That
+reframing is the whole reason this fleet exists.
+
+**Why generate it instead of replaying a market.** Replayed market data is
+unpredictable, and what an engine does on one day tells you little about another.
+But if an engine holds up under a **specific, controlled stress**, you can say
+something *definite*: it handles that stress. So I wanted a generator I fully
+control — feed it a config, and it produces as much order flow as I want, shaped
+the way I want:
+
+- **Scalable** — need more pressure on a contestant? Add another bot-pod. More
+  pods → more concurrent order streams → more depth and more load, with no code
+  change.
+- **Configurable** — I can ask for *thousands of resting orders* to build deep
+  books, or *thousands of aggressive crossing orders* to hammer the matching
+  path, or a *cancel flood* to drain the book — any mix, any volume. **If I can
+  shape the orders, I can shape the stress.**
+- **Deterministic** — same seed + same config ⇒ the exact same order sequence,
+  every time. That buys three things that matter: **fairness** (every contestant
+  faces the identical sequence — bots that reacted to a contestant would hand
+  everyone a different difficulty), **control** (direct dials on the dimensions I
+  want to stress), and **independence** (no dependency on a proprietary historical
+  dataset).
+
+**The configs in this repo are just examples.** `standard`, `cancel_storm`,
+`matching_spike`, etc. are presets *I* found useful — but the phase mixes, the
+volumes, the rates, the book depth are all yours to define. Anyone can write a new
+phase or a new stress profile and generate a completely different kind of pressure.
+The point of the fleet isn't the specific numbers I picked; it's that the stress
+is **fully under your control.**
 
 It's written in Python on purpose: under time constraints, Python's `asyncio`
 made the concurrent "many bots, one socket each" model quick to build and easy to
